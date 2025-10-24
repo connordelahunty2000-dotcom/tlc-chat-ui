@@ -1,6 +1,9 @@
-// Resumable streaming is disabled because chat is proxied to n8n.
-export const dynamic = "force-dynamic";
+// app/(chat)/api/chat/[id]/stream/route.ts
+import { NextResponse } from "next/server";
 
 export async function GET() {
-  return new Response("Resumable streams are disabled.", { status: 410 });
+  return NextResponse.json(
+    { error: "Resumable streams are disabled." },
+    { status: 404 }
+  );
 }
