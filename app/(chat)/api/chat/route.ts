@@ -19,6 +19,15 @@ import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
 export const maxDuration = 60;
 
+// Finish the UI writer safely across SDK versions.
+function finishWriter(writer: unknown) {
+  const w = writer as any;
+  if (w?.end && typeof w.end === "function") return w.end();
+  if (w?.close && typeof w.close === "function") return w.close();
+  if (w?.finish && typeof w.finish === "function") return w.finish();
+  // Some versions auto-finish when execute resolves — do nothing.
+}
+
 export async function POST(request: Request) {
   // 1) Parse body
   let body: PostRequestBody;
@@ -92,7 +101,7 @@ export async function POST(request: Request) {
   if (!webhookUrl) {
     console.error("Missing N8N_WEBHOOK_URL");
     return new ChatSDKError("offline:chat").toResponse();
-    }
+  }
 
   let res: Response | null = null;
   try {
@@ -127,7 +136,7 @@ export async function POST(request: Request) {
         if (!res!.body) {
           const text = await res!.text();
           writer.write({ type: "text-delta", delta: text, id: msgId });
-          writer.end();
+          finishWriter(writer);
           return;
         }
 
@@ -144,7 +153,7 @@ export async function POST(request: Request) {
           });
         }
 
-        writer.end();
+        finishWriter(writer);
       } catch (e) {
         console.error("Proxy stream error", e);
         writer.write({
@@ -152,7 +161,7 @@ export async function POST(request: Request) {
           delta: "There was an error connecting to the assistant.",
           id: msgId,
         });
-        writer.end();
+        finishWriter(writer);
       }
     },
     generateId: generateUUID,
