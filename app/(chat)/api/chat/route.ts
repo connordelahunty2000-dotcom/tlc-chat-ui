@@ -18,7 +18,7 @@ import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
 export const maxDuration = 60;
 
-// Finish the UI writer safely across SDK versions.
+// Safely finish the writer across SDK versions.
 function finishWriter(writer: unknown) {
   const w = writer as any;
   if (w?.end && typeof w.end === "function") return w.end();
@@ -26,7 +26,7 @@ function finishWriter(writer: unknown) {
   if (w?.finish && typeof w.finish === "function") return w.finish();
 }
 
-// Make a deterministic title (no AI), robust to different message part shapes.
+// Deterministic title (no AI) that tolerates part shape differences.
 function makeTitleFromMessage(msg: ChatMessage, fallback = "New chat") {
   try {
     const parts: any[] = (msg as any)?.parts ?? [];
@@ -133,12 +133,13 @@ export async function POST(request: Request) {
     return new ChatSDKError("offline:chat").toResponse();
   }
 
-  // 7) Stream back to the UI
+  // 7) Stream back to UI
   const stream = createUIMessageStream({
     execute: async ({ writer }) => {
       const msgId = generateUUID();
-      // Create the assistant message immediately so the UI has a target to stream into
-      writer.write({ type: "assistant-message", id: msgId });
+
+      // Start a new assistant text stream
+      writer.write({ type: "text-start", id: msgId });
 
       let assistantText = "";
 
@@ -188,9 +189,10 @@ export async function POST(request: Request) {
         }
 
         writer.write({ type: "text-delta", delta: assistantText, id: msgId });
+        writer.write({ type: "text-end", id: msgId });
         finishWriter(writer);
 
-        // Persist assistant message in DB
+        // Persist assistant message
         await saveMessages({
           messages: [
             {
@@ -207,6 +209,7 @@ export async function POST(request: Request) {
         console.error("n8n fetch failed:", e);
         assistantText = "Sorry — I couldn’t reach the agent right now.";
         writer.write({ type: "text-delta", delta: assistantText, id: msgId });
+        writer.write({ type: "text-end", id: msgId });
         finishWriter(writer);
 
         await saveMessages({
