@@ -1,188 +1,166 @@
 // app/(chat)/api/chat/route.ts
-import { NextRequest } from "next/server";
-
+import { JsonToSseTransformStream, createUIMessageStream } from "ai";
 import { auth, type UserType } from "@/app/(auth)/auth";
+import { entitlementsByUserType } from "@/lib/ai/entitlements";
 import { ChatSDKError } from "@/lib/errors";
+import { convertToUIMessages, generateUUID } from "@/lib/utils";
 import {
-  deleteChatById,
+  getMessagesByChatId,
+  getMessageCountByUserId,
   getChatById,
   saveChat,
   saveMessages,
 } from "@/lib/db/queries";
-import { generateUUID } from "@/lib/utils";
+import type { ChatMessage } from "@/lib/types";
+import type { VisibilityType } from "@/components/visibility-selector";
+import type { ChatModel } from "@/lib/ai/models";
 import { generateTitleFromUserMessage } from "../../actions";
-import {
-  type PostRequestBody,
-  postRequestBodySchema,
-} from "./schema";
+import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
-/**
- * Keep this (the UI reads it for function timeout on serverless).
- */
 export const maxDuration = 60;
 
-/**
- * Helper: normalize whatever n8n returns into a plain assistant string.
- * Supports JSON `{answer|text|content}`, or plain text.
- */
-async function extractAssistantText(res: Response): Promise<string> {
-  const ctype = res.headers.get("content-type") || "";
-  try {
-    if (ctype.includes("application/json")) {
-      const json = await res.json();
-      return (
-        json?.answer ??
-        json?.text ??
-        json?.content ??
-        JSON.stringify(json)
-      );
-    }
-    // fallback to text (markdown OK)
-    return await res.text();
-  } catch {
-    // last resort
-    return await res.text();
-  }
-}
-
-export async function POST(req: NextRequest) {
-  // 1) Validate payload from the UI
+export async function POST(request: Request) {
+  // ------- Parse and validate body -------
   let body: PostRequestBody;
   try {
-    const json = await req.json();
-    body = postRequestBodySchema.parse(json);
+    body = postRequestBodySchema.parse(await request.json());
   } catch {
     return new ChatSDKError("bad_request:api").toResponse();
   }
 
-  // 2) Check session
+  const {
+    id,
+    message,
+    selectedChatModel,
+    selectedVisibilityType,
+  }: {
+    id: string;
+    message: ChatMessage;
+    selectedChatModel: ChatModel["id"];
+    selectedVisibilityType: VisibilityType;
+  } = body;
+
+  // ------- Auth -------
   const session = await auth();
-  if (!session?.user) {
-    return new ChatSDKError("unauthorized:chat").toResponse();
-  }
-  const userId = session.user.id as string;
+  if (!session?.user) return new ChatSDKError("unauthorized:chat").toResponse();
+
+  // ------- Simple daily rate limit using existing helper -------
   const userType: UserType = session.user.type;
+  const messageCount = await getMessageCountByUserId({
+    id: session.user.id,
+    differenceInHours: 24,
+  });
+  if (messageCount > entitlementsByUserType[userType].maxMessagesPerDay) {
+    return new ChatSDKError("rate_limit:chat").toResponse();
+  }
 
-  // 3) Ensure chat exists (and belongs to this user); create with a title if needed
-  const { id: chatId, message, selectedVisibilityType } = body;
-
-  const existing = await getChatById({ id: chatId });
-  if (existing) {
-    if (existing.userId !== userId) {
-      return new ChatSDKError("forbidden:chat").toResponse();
-    }
-  } else {
+  // ------- Ensure chat row exists -------
+  const existing = await getChatById({ id });
+  if (existing && existing.userId !== session.user.id) {
+    return new ChatSDKError("forbidden:chat").toResponse();
+  }
+  if (!existing) {
     const title = await generateTitleFromUserMessage({ message });
     await saveChat({
-      id: chatId,
-      userId,
+      id,
+      userId: session.user.id,
       title,
       visibility: selectedVisibilityType,
     });
   }
 
-  // 4) Save the user's message to DB (so history appears immediately)
+  // ------- Build history + persist this user message immediately -------
+  const history = [
+    ...convertToUIMessages(await getMessagesByChatId({ id })),
+    message,
+  ];
   await saveMessages({
     messages: [
       {
-        chatId,
+        chatId: id,
         id: message.id,
         role: "user",
-        parts: message.parts, // already in the UI format
+        parts: message.parts,
         attachments: [],
         createdAt: new Date(),
       },
     ],
   });
 
-  // 5) Forward the whole original payload to n8n
+  // ------- n8n proxy only (NO AI Gateway) -------
   const webhookUrl = process.env.N8N_WEBHOOK_URL;
   if (!webhookUrl) {
-    return Response.json(
-      { error: "Missing N8N_WEBHOOK_URL env var" },
-      { status: 500 }
-    );
+    console.error("Missing N8N_WEBHOOK_URL");
+    return new ChatSDKError("offline:chat").toResponse();
   }
 
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (process.env.N8N_WEBHOOK_TOKEN) {
-    headers.Authorization = `Bearer ${process.env.N8N_WEBHOOK_TOKEN}`;
-  }
-
-  let n8nResponse: Response;
+  let res: Response | null = null;
   try {
-    n8nResponse = await fetch(webhookUrl, {
+    res = await fetch(webhookUrl, {
       method: "POST",
-      headers,
-      body: JSON.stringify(body),
+      headers: {
+        "Content-Type": "application/json",
+        ...(process.env.N8N_WEBHOOK_TOKEN
+          ? { Authorization: `Bearer ${process.env.N8N_WEBHOOK_TOKEN}` }
+          : {}),
+      },
+      body: JSON.stringify({
+        chatId: id,
+        model: selectedChatModel,
+        message,
+        history,            // full UI-formatted history
+        user: session.user, // include if your flow needs it
+      }),
     });
-  } catch (err: any) {
-    return Response.json(
-      { error: "Failed to reach n8n webhook", details: String(err?.message || err) },
-      { status: 502 }
-    );
+  } catch (err) {
+    console.error("Failed to reach n8n webhook:", err);
   }
 
-  // 6) Read the assistant text from n8n
-  const assistantText = await extractAssistantText(n8nResponse);
+  if (!res) return new ChatSDKError("offline:chat").toResponse();
 
-  // 7) Persist the assistant message to DB
-  const assistantMessageId = generateUUID();
-  await saveMessages({
-    messages: [
-      {
-        chatId,
-        id: assistantMessageId,
-        role: "assistant",
-        parts: [
-          {
-            type: "text",
-            text: assistantText,
-          },
-        ],
-        attachments: [],
-        createdAt: new Date(),
-      },
-    ],
+  // ------- Stream n8n response to UI (or buffer if non-streaming) -------
+  const stream = createUIMessageStream({
+    execute: async ({ writer }) => {
+      try {
+        if (!res!.body) {
+          const text = await res!.text();
+          writer.write({ type: "text-delta", data: text });
+          writer.close();
+          return;
+        }
+        const reader = res!.body.getReader();
+        const td = new TextDecoder();
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          writer.write({ type: "text-delta", data: td.decode(value) });
+        }
+        writer.close();
+      } catch (e) {
+        console.error("Proxy stream error", e);
+        writer.write({
+          type: "error",
+          data: "There was an error connecting to the assistant.",
+        });
+        writer.close();
+      }
+    },
+    generateId: generateUUID,
+    onFinish: async ({ messages }) => {
+      // persist assistant messages
+      await saveMessages({
+        messages: messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          parts: m.parts,
+          createdAt: new Date(),
+          attachments: [],
+          chatId: id,
+        })),
+      });
+    },
+    onError: () => "Oops, an error occurred!",
   });
 
-  // 8) Return a simple JSON payload to the UI.
-  // (If you later want streaming, we can wrap this in SSE.)
-  return Response.json(
-    {
-      id: assistantMessageId,
-      role: "assistant",
-      content: assistantText,
-    },
-    { status: n8nResponse.ok ? 200 : n8nResponse.status }
-  );
-}
-
-/**
- * Keep the DELETE handler so the UI can delete chats.
- * (Unchanged from your template logic.)
- */
-export async function DELETE(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const id = searchParams.get("id");
-
-  if (!id) {
-    return new ChatSDKError("bad_request:api").toResponse();
-  }
-
-  const session = await auth();
-
-  if (!session?.user) {
-    return new ChatSDKError("unauthorized:chat").toResponse();
-  }
-
-  const chat = await getChatById({ id });
-
-  if (chat?.userId !== session.user.id) {
-    return new ChatSDKError("forbidden:chat").toResponse();
-  }
-
-  const deletedChat = await deleteChatById({ id });
-
-  return Response.json(deletedChat, { status: 200 });
+  return new Response(stream.pipeThrough(new JsonToSseTransformStream()));
 }
