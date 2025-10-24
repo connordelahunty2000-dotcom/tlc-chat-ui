@@ -44,7 +44,7 @@ export async function POST(request: Request) {
   const session = await auth();
   if (!session?.user) return new ChatSDKError("unauthorized:chat").toResponse();
 
-  // ------- Simple daily rate limit using existing helper -------
+  // ------- Simple daily rate limit -------
   const userType: UserType = session.user.type;
   const messageCount = await getMessageCountByUserId({
     id: session.user.id,
@@ -69,7 +69,7 @@ export async function POST(request: Request) {
     });
   }
 
-  // ------- Build history + persist this user message immediately -------
+  // ------- Build history + persist user message -------
   const history = [
     ...convertToUIMessages(await getMessagesByChatId({ id })),
     message,
@@ -124,7 +124,7 @@ export async function POST(request: Request) {
       try {
         if (!res!.body) {
           const text = await res!.text();
-          writer.write({ type: "text-delta", data: text });
+          writer.write({ type: "text-delta", delta: text });
           writer.close();
           return;
         }
@@ -133,14 +133,14 @@ export async function POST(request: Request) {
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-          writer.write({ type: "text-delta", data: td.decode(value) });
+          writer.write({ type: "text-delta", delta: td.decode(value) });
         }
         writer.close();
       } catch (e) {
         console.error("Proxy stream error", e);
         writer.write({
-          type: "error",
-          data: "There was an error connecting to the assistant.",
+          type: "text-delta",
+          delta: "There was an error connecting to the assistant.",
         });
         writer.close();
       }
