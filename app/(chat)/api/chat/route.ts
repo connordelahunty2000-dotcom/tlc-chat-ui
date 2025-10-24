@@ -14,7 +14,6 @@ import {
 import type { ChatMessage } from "@/lib/types";
 import type { VisibilityType } from "@/components/visibility-selector";
 import type { ChatModel } from "@/lib/ai/models";
-import { generateTitleFromUserMessage } from "../../actions";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
 export const maxDuration = 60;
@@ -25,7 +24,21 @@ function finishWriter(writer: unknown) {
   if (w?.end && typeof w.end === "function") return w.end();
   if (w?.close && typeof w.close === "function") return w.close();
   if (w?.finish && typeof w.finish === "function") return w.finish();
-  // Some versions auto-finish when execute resolves — do nothing.
+}
+
+// Make a simple title without AI
+function makeTitleFromMessage(msg: ChatMessage, fallback = "New chat") {
+  try {
+    const firstText =
+      msg?.parts?.find((p: any) => p?.type === "text")?.text ??
+      (Array.isArray(msg?.parts) ? String(msg.parts[0] ?? "") : "");
+    if (!firstText) return fallback;
+    // take first ~8 words
+    const words = firstText.trim().split(/\s+/).slice(0, 8).join(" ");
+    return words.length > 80 ? words.slice(0, 80) : words || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export async function POST(request: Request) {
@@ -69,7 +82,7 @@ export async function POST(request: Request) {
     return new ChatSDKError("forbidden:chat").toResponse();
   }
   if (!chat) {
-    const title = await generateTitleFromUserMessage({ message });
+    const title = makeTitleFromMessage(message);
     await saveChat({
       id,
       userId: session.user.id,
