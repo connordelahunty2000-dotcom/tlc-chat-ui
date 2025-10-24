@@ -158,62 +158,74 @@ export async function POST(request: Request) {
 
   if (!res) return new ChatSDKError("offline:chat").toResponse();
 
-  // 7) Stream n8n response back to UI
-  const msgId = generateUUID();
+  // ...inside createUIMessageStream({ execute: ({ writer }) => { ... } })
+const msgId = generateUUID();
 
-  const stream = createUIMessageStream({
-    execute: async ({ writer }) => {
-      try {
-        if (!res!.body) {
-          const text = await res!.text();
-          (writer as any).write?.({
-            type: "text-delta",
-            delta: text,
-            id: msgId,
-          });
-          finishWriter(writer);
-          return;
-        }
+(async () => {
+  try {
+    const res = await fetch(process.env.N8N_WEBHOOK_URL!, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        streamId,                    // pass through if you set it earlier
+        chatId: id,
+        user: session.user,
+        message,                     // the raw message the user sent
+        history: uiMessages,         // previous messages if you send them
+      }),
+    });
 
-        const reader = res!.body.getReader();
-        const decoder = new TextDecoder();
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          (writer as any).write?.({
-            type: "text-delta",
-            delta: decoder.decode(value),
-            id: msgId,
-          });
-        }
-
-        finishWriter(writer);
-      } catch (e) {
-        console.error("Proxy stream error", e);
-        (writer as any).write?.({
-          type: "text-delta",
-          delta: "There was an error connecting to the assistant.",
-          id: msgId,
-        });
-        finishWriter(writer);
-      }
-    },
-    generateId: generateUUID,
-    onFinish: async ({ messages }) => {
-      await saveMessages({
-        messages: messages.map((m) => ({
-          id: m.id,
-          role: m.role,
-          parts: m.parts,
-          createdAt: new Date(),
-          attachments: [],
-          chatId: id,
-        })),
+    // If n8n itself failed, surface the error text instead of throwing.
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      writer.write({
+        type: "text-delta",
+        delta:
+          errText ||
+          `Sorry — the workflow returned ${res.status} ${res.statusText}.`,
+        id: msgId,
       });
-    },
-    onError: () => "Oops, an error occurred!",
-  });
+      writer.done();
+      return;
+    }
+
+    // Be robust to either JSON or text replies from "Respond to Webhook".
+    const ct = res.headers.get("content-type") || "";
+    let answer = "";
+
+    if (ct.includes("application/json")) {
+      const data: any = await res.json().catch(() => ({}));
+      // Try common keys; fall back to stringify
+      answer =
+        String(
+          data.output ??
+            data.answer ??
+            data.text ??
+            data.message ??
+            ""
+        ) || JSON.stringify(data);
+    } else {
+      answer = await res.text();
+    }
+
+    if (!answer) {
+      answer = "I didn’t receive a reply from the agent.";
+    }
+
+    writer.write({ type: "text-delta", delta: answer, id: msgId });
+    writer.done(); // **always** finish the UI stream
+  } catch (e: any) {
+    // Never throw—stream a friendly error and end cleanly
+    console.error("n8n fetch failed:", e?.message || e);
+    writer.write({
+      type: "text-delta",
+      delta: "Sorry — I couldn’t reach the agent right now.",
+      id: msgId,
+    });
+    writer.done();
+  }
+})();
+
 
   return new Response(stream.pipeThrough(new JsonToSseTransformStream()));
 }
