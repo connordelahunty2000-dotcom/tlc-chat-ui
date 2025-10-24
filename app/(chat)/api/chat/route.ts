@@ -26,16 +26,34 @@ function finishWriter(writer: unknown) {
   if (w?.finish && typeof w.finish === "function") return w.finish();
 }
 
-// Make a simple title without AI
+// Make a simple title without AI (safe across message part shapes)
 function makeTitleFromMessage(msg: ChatMessage, fallback = "New chat") {
   try {
-    const firstText =
-      msg?.parts?.find((p: any) => p?.type === "text")?.text ??
-      (Array.isArray(msg?.parts) ? String(msg.parts[0] ?? "") : "");
+    const parts: any[] = (msg as any)?.parts ?? [];
+    let firstText: string | undefined;
+
+    for (const p of parts) {
+      if (p && typeof p === "object") {
+        if (p.type === "text" && typeof p.text === "string") {
+          firstText = p.text;
+          break;
+        }
+        if (p.type === "input_text" && typeof p.input_text === "string") {
+          firstText = p.input_text;
+          break;
+        }
+      } else if (typeof p === "string") {
+        firstText = p;
+        break;
+      }
+    }
+
+    if (!firstText) firstText = String(parts[0] ?? "");
     if (!firstText) return fallback;
-    // take first ~8 words
+
     const words = firstText.trim().split(/\s+/).slice(0, 8).join(" ");
-    return words.length > 80 ? words.slice(0, 80) : words || fallback;
+    const clipped = words.length > 80 ? words.slice(0, 80) : words;
+    return clipped || fallback;
   } catch {
     return fallback;
   }
@@ -76,7 +94,7 @@ export async function POST(request: Request) {
     return new ChatSDKError("rate_limit:chat").toResponse();
   }
 
-  // 4) Ensure chat exists
+  // 4) Ensure chat exists (no AI title; deterministic)
   const chat = await getChatById({ id });
   if (chat && chat.userId !== session.user.id) {
     return new ChatSDKError("forbidden:chat").toResponse();
@@ -109,7 +127,7 @@ export async function POST(request: Request) {
     ],
   });
 
-  // 6) Call your n8n webhook (no AI Gateway)
+  // 6) Call your n8n webhook (no AI Gateway anywhere)
   const webhookUrl = process.env.N8N_WEBHOOK_URL;
   if (!webhookUrl) {
     console.error("Missing N8N_WEBHOOK_URL");
@@ -148,7 +166,11 @@ export async function POST(request: Request) {
       try {
         if (!res!.body) {
           const text = await res!.text();
-          writer.write({ type: "text-delta", delta: text, id: msgId });
+          (writer as any).write?.({
+            type: "text-delta",
+            delta: text,
+            id: msgId,
+          });
           finishWriter(writer);
           return;
         }
@@ -159,7 +181,7 @@ export async function POST(request: Request) {
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-          writer.write({
+          (writer as any).write?.({
             type: "text-delta",
             delta: decoder.decode(value),
             id: msgId,
@@ -169,7 +191,7 @@ export async function POST(request: Request) {
         finishWriter(writer);
       } catch (e) {
         console.error("Proxy stream error", e);
-        writer.write({
+        (writer as any).write?.({
           type: "text-delta",
           delta: "There was an error connecting to the assistant.",
           id: msgId,
