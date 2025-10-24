@@ -18,7 +18,16 @@ import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
 export const maxDuration = 60;
 
-/** Generate a deterministic title from the first text-like part (no AI). */
+/** Finish the UI writer safely across SDK versions (done/close/end/finish). */
+function finishWriter(writer: unknown) {
+  const w = writer as any;
+  if (typeof w?.done === "function") return w.done();
+  if (typeof w?.close === "function") return w.close();
+  if (typeof w?.end === "function") return w.end();
+  if (typeof w?.finish === "function") return w.finish();
+}
+
+/** Deterministic title from first text-like part (no AI). */
 function makeTitleFromMessage(msg: ChatMessage, fallback = "New chat") {
   try {
     const parts: any[] = (msg as any)?.parts ?? [];
@@ -147,17 +156,16 @@ export async function POST(request: Request) {
           }),
         });
 
-        // If n8n errored, stream its text (don’t throw).
         if (!res.ok) {
           const errText = await res.text().catch(() => "");
-          writer.write({
+          (writer as any).write({
             type: "text-delta",
             delta:
               errText ||
               `Sorry — the workflow returned ${res.status} ${res.statusText}.`,
             id: msgId,
           });
-          writer.done();
+          finishWriter(writer);
           return;
         }
 
@@ -181,8 +189,8 @@ export async function POST(request: Request) {
         if (!answer) answer = "I didn’t receive a reply from the agent.";
 
         // Stream to UI
-        writer.write({ type: "text-delta", delta: answer, id: msgId });
-        writer.done();
+        (writer as any).write({ type: "text-delta", delta: answer, id: msgId });
+        finishWriter(writer);
 
         // Persist assistant message
         try {
@@ -203,12 +211,12 @@ export async function POST(request: Request) {
         }
       } catch (e: any) {
         console.error("n8n fetch failed:", e?.message || e);
-        writer.write({
+        (writer as any).write({
           type: "text-delta",
           delta: "Sorry — I couldn’t reach the agent right now.",
           id: msgId,
         });
-        writer.done();
+        finishWriter(writer);
       }
     },
   });
