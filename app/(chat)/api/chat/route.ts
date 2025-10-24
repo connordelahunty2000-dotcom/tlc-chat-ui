@@ -18,16 +18,15 @@ import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
 export const maxDuration = 60;
 
-/** Finish the UI writer safely across SDK versions (done/close/end/finish). */
+// Finish the writer safely across SDK versions
 function finishWriter(writer: unknown) {
   const w = writer as any;
-  if (typeof w?.done === "function") return w.done();
-  if (typeof w?.close === "function") return w.close();
-  if (typeof w?.end === "function") return w.end();
-  if (typeof w?.finish === "function") return w.finish();
+  if (w?.end && typeof w.end === "function") return w.end();
+  if (w?.close && typeof w.close === "function") return w.close();
+  if (w?.finish && typeof w.finish === "function") return w.finish();
 }
 
-/** Deterministic title from first text-like part (no AI). */
+// Make a simple title (no AI dependency)
 function makeTitleFromMessage(msg: ChatMessage, fallback = "New chat") {
   try {
     const parts: any[] = (msg as any)?.parts ?? [];
@@ -53,14 +52,15 @@ function makeTitleFromMessage(msg: ChatMessage, fallback = "New chat") {
     if (!firstText) return fallback;
 
     const words = firstText.trim().split(/\s+/).slice(0, 8).join(" ");
-    return words.length > 80 ? words.slice(0, 80) : words;
+    const clipped = words.length > 80 ? words.slice(0, 80) : words;
+    return clipped || fallback;
   } catch {
     return fallback;
   }
 }
 
 export async function POST(request: Request) {
-  // 1) Parse request body
+  // 1) Parse
   let body: PostRequestBody;
   try {
     body = postRequestBodySchema.parse(await request.json());
@@ -84,7 +84,7 @@ export async function POST(request: Request) {
   const session = await auth();
   if (!session?.user) return new ChatSDKError("unauthorized:chat").toResponse();
 
-  // 3) Rate limit
+  // 3) Rate limit (24h)
   const userType: UserType = session.user.type;
   const messageCount = await getMessageCountByUserId({
     id: session.user.id,
@@ -100,16 +100,17 @@ export async function POST(request: Request) {
     return new ChatSDKError("forbidden:chat").toResponse();
   }
   if (!chat) {
+    const title = makeTitleFromMessage(message);
     await saveChat({
       id,
       userId: session.user.id,
-      title: makeTitleFromMessage(message),
+      title,
       visibility: selectedVisibilityType,
     });
   }
 
-  // 5) Build history and persist user message
-  const history = [
+  // 5) History + persist the user message
+  const uiHistory = [
     ...convertToUIMessages(await getMessagesByChatId({ id })),
     message,
   ];
@@ -126,99 +127,107 @@ export async function POST(request: Request) {
     ],
   });
 
-  // 6) Validate webhook config
+  // 6) Validate webhook env
   const webhookUrl = process.env.N8N_WEBHOOK_URL;
   if (!webhookUrl) {
     console.error("Missing N8N_WEBHOOK_URL");
     return new ChatSDKError("offline:chat").toResponse();
   }
 
-  // 7) Stream response to the UI and fetch from n8n inside the writer
+  // 7) Stream a single assistant message built from n8n's reply
   const stream = createUIMessageStream({
-    execute: async ({ writer }) => {
+    execute: ({ writer }) => {
+      const w = writer as any; // loosen typings for cross-version compatibility
       const msgId = generateUUID();
 
-      try {
-        const res = await fetch(webhookUrl, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            ...(process.env.N8N_WEBHOOK_TOKEN
-              ? { Authorization: `Bearer ${process.env.N8N_WEBHOOK_TOKEN}` }
-              : {}),
-          },
-          body: JSON.stringify({
-            chatId: id,
-            model: selectedChatModel,
-            message,
-            history,
-            user: session.user,
-          }),
-        });
-
-        if (!res.ok) {
-          const errText = await res.text().catch(() => "");
-          (writer as any).write({
-            type: "text-delta",
-            delta:
-              errText ||
-              `Sorry — the workflow returned ${res.status} ${res.statusText}.`,
-            id: msgId,
-          });
-          finishWriter(writer);
-          return;
-        }
-
-        // Parse either JSON or text from Respond to Webhook
-        const ct = res.headers.get("content-type") || "";
-        let answer = "";
-        if (ct.includes("application/json")) {
-          const data: any = await res.json().catch(() => ({}));
-          answer =
-            String(
-              data.output ??
-                data.answer ??
-                data.text ??
-                data.message ??
-                ""
-            ) || JSON.stringify(data);
-        } else {
-          answer = await res.text();
-        }
-
-        if (!answer) answer = "I didn’t receive a reply from the agent.";
-
-        // Stream to UI
-        (writer as any).write({ type: "text-delta", delta: answer, id: msgId });
-        finishWriter(writer);
-
-        // Persist assistant message
+      (async () => {
         try {
-          await saveMessages({
-            messages: [
-              {
-                chatId: id,
-                id: msgId,
-                role: "assistant",
-                parts: [{ type: "text", text: answer }] as any,
-                attachments: [],
-                createdAt: new Date(),
-              },
-            ],
+          const res = await fetch(webhookUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(process.env.N8N_WEBHOOK_TOKEN
+                ? { Authorization: `Bearer ${process.env.N8N_WEBHOOK_TOKEN}` }
+                : {}),
+            },
+            body: JSON.stringify({
+              chatId: id,
+              model: selectedChatModel,
+              message,         // the raw user message
+              history: uiHistory,
+              user: session.user,
+            }),
           });
-        } catch (dbErr) {
-          console.warn("Unable to persist assistant message:", dbErr);
+
+          // If n8n itself failed, show its text body as the error message
+          if (!res.ok) {
+            const errText = await res.text().catch(() => "");
+            w.write({ type: "message-start", id: msgId, role: "assistant" });
+            w.write({
+              type: "text-delta",
+              id: msgId,
+              delta:
+                errText ||
+                `Sorry — the workflow returned ${res.status} ${res.statusText}.`,
+            });
+            w.write({ type: "message-end", id: msgId });
+            finishWriter(w);
+            return;
+          }
+
+          // Accept JSON ({ output: "..." } or similar) or plain text
+          const ct = res.headers.get("content-type") || "";
+          let answer = "";
+          if (ct.includes("application/json")) {
+            const data: any = await res.json().catch(() => ({}));
+            answer =
+              String(
+                data.output ??
+                  data.answer ??
+                  data.text ??
+                  data.message ??
+                  ""
+              ) || JSON.stringify(data);
+          } else {
+            answer = await res.text();
+          }
+          if (!answer) {
+            answer = "I didn’t receive a reply from the agent.";
+          }
+
+          // IMPORTANT: bracket the delta with start/end so the UI renders
+          w.write({ type: "message-start", id: msgId, role: "assistant" });
+          w.write({ type: "text-delta", id: msgId, delta: answer });
+          w.write({ type: "message-end", id: msgId });
+          finishWriter(w);
+        } catch (e: any) {
+          console.error("n8n fetch failed:", e?.message || e);
+          w.write({ type: "message-start", id: msgId, role: "assistant" });
+          w.write({
+            type: "text-delta",
+            id: msgId,
+            delta: "Sorry — I couldn’t reach the agent right now.",
+          });
+          w.write({ type: "message-end", id: msgId });
+          finishWriter(w);
         }
-      } catch (e: any) {
-        console.error("n8n fetch failed:", e?.message || e);
-        (writer as any).write({
-          type: "text-delta",
-          delta: "Sorry — I couldn’t reach the agent right now.",
-          id: msgId,
-        });
-        finishWriter(writer);
-      }
+      })();
     },
+    generateId: generateUUID,
+    onFinish: async ({ messages }) => {
+      // Persist whatever the client received (assistant + any metadata)
+      await saveMessages({
+        messages: messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          parts: m.parts,
+          createdAt: new Date(),
+          attachments: [],
+          chatId: id,
+        })),
+      });
+    },
+    onError: () => "Oops, an error occurred!",
   });
 
   return new Response(stream.pipeThrough(new JsonToSseTransformStream()));
