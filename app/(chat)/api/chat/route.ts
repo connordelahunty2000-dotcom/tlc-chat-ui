@@ -20,7 +20,7 @@ import { type PostRequestBody, postRequestBodySchema } from "./schema";
 export const maxDuration = 60;
 
 export async function POST(request: Request) {
-  // ------- Parse and validate body -------
+  // 1) Parse body
   let body: PostRequestBody;
   try {
     body = postRequestBodySchema.parse(await request.json());
@@ -40,11 +40,11 @@ export async function POST(request: Request) {
     selectedVisibilityType: VisibilityType;
   } = body;
 
-  // ------- Auth -------
+  // 2) Auth
   const session = await auth();
   if (!session?.user) return new ChatSDKError("unauthorized:chat").toResponse();
 
-  // ------- Simple daily rate limit -------
+  // 3) Simple rate limit
   const userType: UserType = session.user.type;
   const messageCount = await getMessageCountByUserId({
     id: session.user.id,
@@ -54,12 +54,12 @@ export async function POST(request: Request) {
     return new ChatSDKError("rate_limit:chat").toResponse();
   }
 
-  // ------- Ensure chat row exists -------
-  const existing = await getChatById({ id });
-  if (existing && existing.userId !== session.user.id) {
+  // 4) Ensure chat exists
+  const chat = await getChatById({ id });
+  if (chat && chat.userId !== session.user.id) {
     return new ChatSDKError("forbidden:chat").toResponse();
   }
-  if (!existing) {
+  if (!chat) {
     const title = await generateTitleFromUserMessage({ message });
     await saveChat({
       id,
@@ -69,8 +69,8 @@ export async function POST(request: Request) {
     });
   }
 
-  // ------- Build history + persist user message -------
-  const history = [
+  // 5) Build history + persist the user message
+  const uiHistory = [
     ...convertToUIMessages(await getMessagesByChatId({ id })),
     message,
   ];
@@ -87,7 +87,7 @@ export async function POST(request: Request) {
     ],
   });
 
-  // ------- n8n proxy only (NO AI Gateway) -------
+  // 6) Call your n8n webhook (no AI Gateway)
   const webhookUrl = process.env.N8N_WEBHOOK_URL;
   if (!webhookUrl) {
     console.error("Missing N8N_WEBHOOK_URL");
@@ -108,8 +108,8 @@ export async function POST(request: Request) {
         chatId: id,
         model: selectedChatModel,
         message,
-        history,            // full UI-formatted history
-        user: session.user, // include if your flow needs it
+        history: uiHistory,
+        user: session.user,
       }),
     });
   } catch (err) {
@@ -118,36 +118,45 @@ export async function POST(request: Request) {
 
   if (!res) return new ChatSDKError("offline:chat").toResponse();
 
-  // ------- Stream n8n response to UI (or buffer if non-streaming) -------
+  // 7) Stream n8n response back to UI
+  const msgId = generateUUID();
+
   const stream = createUIMessageStream({
     execute: async ({ writer }) => {
       try {
         if (!res!.body) {
           const text = await res!.text();
-          writer.write({ type: "text-delta", delta: text });
+          writer.write({ type: "text-delta", delta: text, id: msgId });
           writer.close();
           return;
         }
+
         const reader = res!.body.getReader();
-        const td = new TextDecoder();
+        const decoder = new TextDecoder();
+
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-          writer.write({ type: "text-delta", delta: td.decode(value) });
+          writer.write({
+            type: "text-delta",
+            delta: decoder.decode(value),
+            id: msgId,
+          });
         }
+
         writer.close();
       } catch (e) {
         console.error("Proxy stream error", e);
         writer.write({
           type: "text-delta",
           delta: "There was an error connecting to the assistant.",
+          id: msgId,
         });
         writer.close();
       }
     },
     generateId: generateUUID,
     onFinish: async ({ messages }) => {
-      // persist assistant messages
       await saveMessages({
         messages: messages.map((m) => ({
           id: m.id,
