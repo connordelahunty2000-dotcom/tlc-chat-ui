@@ -92,7 +92,7 @@ export async function POST(request: Request) {
   if (!webhookUrl) {
     console.error("Missing N8N_WEBHOOK_URL");
     return new ChatSDKError("offline:chat").toResponse();
-  }
+    }
 
   let res: Response | null = null;
   try {
@@ -127,7 +127,7 @@ export async function POST(request: Request) {
         if (!res!.body) {
           const text = await res!.text();
           writer.write({ type: "text-delta", delta: text, id: msgId });
-          writer.close();
+          writer.end();
           return;
         }
 
@@ -144,7 +144,7 @@ export async function POST(request: Request) {
           });
         }
 
-        writer.close();
+        writer.end();
       } catch (e) {
         console.error("Proxy stream error", e);
         writer.write({
@@ -152,7 +152,7 @@ export async function POST(request: Request) {
           delta: "There was an error connecting to the assistant.",
           id: msgId,
         });
-        writer.close();
+        writer.end();
       }
     },
     generateId: generateUUID,
