@@ -1,9 +1,3 @@
-/* --- Hide the Vercel deploy badge in the top header --- */
-/* It’s an <a> that points to vercel.com/new... */
-header a[href*="vercel.com/new"] {
-  display: none !important;
-}
-
 @import "tailwindcss";
 
 /* include utility classes in streamdown */
